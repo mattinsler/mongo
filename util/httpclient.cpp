@@ -111,6 +111,7 @@ namespace mongo {
             sb << buf;
         
         while ( ( got = p.unsafe_recv( buf , 4096 ) ) > 0){
+            buf[ got ] = 0;
             if ( result )
                 sb << buf;
         }
