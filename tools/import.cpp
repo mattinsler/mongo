@@ -22,15 +22,31 @@
 
 #include "tool.h"
 #include "../util/text.h"
+#include "../util/httpclient.h"
+#include "../bson/bsontypes.h"
 
+#include <vector>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 
 #include <boost/program_options.hpp>
 
 using namespace mongo;
 
 namespace po = boost::program_options;
+
+struct element_to_object {
+	vector<BSONObj> *_container;
+	
+	element_to_object( vector<BSONObj> *container )
+	: _container( container )
+	{}
+	
+	void operator()(BSONElement e){
+		_container->push_back(e.Obj());
+	}
+};
 
 class Import : public Tool {
     
@@ -43,6 +59,7 @@ class Import : public Tool {
     bool _upsert;
     bool _doimport;
     bool _jsonArray;
+	string _root;
     vector<string> _upsertFields;
     
     void _append( BSONObjBuilder& b , const string& fieldName , const string& data ){
@@ -56,7 +73,7 @@ class Import : public Tool {
         b.append( fieldName , data );
     }
     
-    BSONObj parseLine( char * line ){
+    void parseLine( char * line, vector<BSONObj> *objects ){
         uassert(13289, "Invalid UTF8 character detected", isValidUTF8(line));
 
         if ( _type == JSON ){
@@ -65,7 +82,30 @@ class Import : public Tool {
                 *end = 0;
                 end--;
             }
-            return fromjson( line );
+			BSONObj bson = fromjson( line );
+			if ( _root.size() > 0 ) {
+				BSONElement e = bson.getFieldDotted( _root.c_str() );
+				if ( e.eoo() )
+					cerr << "json root element is not available in json data" << endl;
+				else {
+					switch ( e.type() ) {
+						case Object:
+							objects->push_back( e.Obj() );
+							break;
+						case Array:{
+							vector<BSONElement> elements = e.Array();
+							std::for_each( elements.begin(), elements.end(), element_to_object(objects) );
+							break;
+						}
+						default:
+							cerr << "json root element is not an object or array" << endl;
+							break;
+					}
+				}
+			} else {
+				objects->push_back(bson);
+			}
+            return;
         }
         
         BSONObjBuilder b;
@@ -132,7 +172,7 @@ class Import : public Tool {
             if ( done )
                 break;
         }
-        return b.obj();
+		objects->push_back(b.obj());
     }
     
 public:
@@ -141,9 +181,11 @@ public:
         add_options()
             ("ignoreBlanks","if given, empty fields in csv and tsv will be ignored")
             ("type",po::value<string>() , "type of file to import.  default: json (json,csv,tsv)")
-            ("file",po::value<string>() , "file to import from; if not specified stdin is used" )
+            ("file",po::value<string>() , "file to import from; if this and url not specified stdin is used" )
+            ("url",po::value<string>() , "url to import from; if this and file not specified stdin is used" )
             ("drop", "drop collection first " )
             ("headerline","CSV,TSV only - use first line as headers")
+            ("jsonRoot",po::value<string>(),"JSON only - take data from within this root (useful with url)" )
             ("upsert", "insert or update objects that already exist" )
             ("upsertFields", po::value<string>(), "comma-separated fields for the query part of the upsert. You should make sure this is indexed" )
             ("stopOnError", "stop importing at first error rather than continuing" )
@@ -163,13 +205,36 @@ public:
     
     int run(){
         string filename = getParam( "file" );
+		string url = getParam( "url" );
         long long fileSize = -1;
 
         istream * in = &cin;
 
-        ifstream file( filename.c_str() , ios_base::in);
-
-        if ( filename.size() > 0 && filename != "-" ){
+		if ( url.size() > 0 && filename.size() > 0 ){
+			cerr << "both url and file cannot be specified" << endl;
+			return -1;
+		}
+		
+		_root = getParam( "jsonRoot" );
+		
+		stringstream iss;
+		ifstream file( filename.c_str() , ios_base::in );
+		
+		if ( url.size() > 0 ){
+			HttpClient c;
+			HttpClient::Result r;
+			int rc = c.get( url , &r );
+			log(1) << "url fetch response code: " << rc << endl;
+			if ( rc != 200 ){
+				log() << "url fetch error response code:" << rc << endl;
+				log(1) << "url fetch error body:" << r.getEntireResponse() << endl;
+				return -1;
+			}
+			iss << r.getBody();
+			in = &iss;
+			fileSize = r.getBody().size();
+		}
+		else if ( filename.size() > 0 && filename != "-" ){
             if ( ! exists( filename ) ){
                 cerr << "file doesn't exist: " << filename << endl;
                 return -1;
@@ -294,40 +359,42 @@ public:
             }
 
             try {
-                BSONObj o;
+				vector<BSONObj> objects;
+				
                 if (_jsonArray){
                     int jslen;
-                    o = fromjson(buf, &jslen);
+					objects.push_back( fromjson(buf, &jslen) );
                     len += jslen;
                     buf += jslen;
                 } else {
-                    o = parseLine( buf );
+                    parseLine( buf, &objects );
                 }
 
                 if ( _headerLine ){
                     _headerLine = false;
                 } else if (_doimport) {
-                    bool doUpsert = _upsert;
-                    BSONObjBuilder b;
-                    if (_upsert){
-                        for (vector<string>::const_iterator it=_upsertFields.begin(), end=_upsertFields.end(); it!=end; ++it){
-                            BSONElement e = o.getFieldDotted(it->c_str());
-                            if (e.eoo()){
-                                doUpsert = false;
-                                break;
-                            }
-                            b.appendAs(e, *it);
-                        }
-                    }
+					for (vector<BSONObj>::const_iterator b_it=objects.begin(), end=objects.end(); b_it!=end; ++b_it){
+						bool doUpsert = _upsert;
+						BSONObjBuilder b;
+						if (_upsert){
+							for (vector<string>::const_iterator it=_upsertFields.begin(), end=_upsertFields.end(); it!=end; ++it){
+								BSONElement e = b_it->getFieldDotted(it->c_str());
+								if (e.eoo()){
+									doUpsert = false;
+									break;
+								}
+								b.appendAs(e, *it);
+							}
+						}
 
-                    if (doUpsert){
-                        conn().update(ns, Query(b.obj()), o, true);
-                    } else {
-                        conn().insert( ns.c_str() , o );
-                    }
+						if (doUpsert){
+							conn().update(ns, Query(b.obj()), *b_it, true);
+						} else {
+							conn().insert( ns.c_str() , *b_it );
+						}
+						++num;
+					}
                 }
-
-                num++;
             }
             catch ( std::exception& e ){
                 cout << "exception:" << e.what() << endl;
